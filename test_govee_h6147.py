@@ -65,9 +65,9 @@ def test_name_matching():
     h6147 = g.model_filter("H6147")
     assert h6147(Dev(None), Adv("ihoment_H6147_1A2B"))
     assert h6147(Dev("Govee_h6147_FFEE"), Adv(None))
-    assert not h6147(Dev("GBK_H618E_688F"), Adv(None))
+    assert not h6147(Dev("GBK_H618E_1A2B"), Adv(None))
     assert not h6147(Dev(None), Adv(None))
-    assert g.model_filter("h618e")(Dev("GBK_H618E_688F"), Adv(None))
+    assert g.model_filter("h618e")(Dev("GBK_H618E_1A2B"), Adv(None))
 
 
 def test_model_flag_defaults_to_h6147():

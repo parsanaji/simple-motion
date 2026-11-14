@@ -1,4 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#0284c7"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">L</text>
+  <defs>
+    <linearGradient id="strip" x1="0" x2="1">
+      <stop offset="0" stop-color="#ff3b30" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#ff3b30"/>
+      <stop offset="1" stop-color="#ff3b30" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0f172a"/>
+  <!-- detection box corners -->
+  <g fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round">
+    <path d="M16 22v-6h6M42 16h6v6M48 40v6h-6M22 46h-6v-6"/>
+  </g>
+  <!-- moving figure with motion trail -->
+  <circle cx="35" cy="26" r="4" fill="#f8fafc"/>
+  <path d="M35 31v8m0-5l-5 3m5-3l5 3m-5 2l-4 5m4-5l4 5" stroke="#f8fafc" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <path d="M22 28h6M20 33h7M23 38h5" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+  <!-- LED strip glow -->
+  <rect x="10" y="53" width="44" height="3" rx="1.5" fill="url(#strip)"/>
 </svg>
