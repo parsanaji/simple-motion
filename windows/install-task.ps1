@@ -8,6 +8,7 @@
     powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera 1
     powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera rtsp://127.0.0.1:8554/cam
     powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera 0 -ExtraArgs --hold,30
+    powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera rtsp://127.0.0.1:8554/cam -ExtraArgs --serve,8890
     powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Stop
     powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Uninstall
 
@@ -24,6 +25,8 @@ param(
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
+# powershell -File passes "--hold,30" as one string, not a list: split it.
+$ExtraArgs = @($ExtraArgs | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' })
 $root = Split-Path -Parent $PSScriptRoot
 $launcher = Join-Path $PSScriptRoot 'simple-motion.vbs'
 $script = Join-Path $root 'motion_detect.py'

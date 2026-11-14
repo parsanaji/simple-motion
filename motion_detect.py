@@ -17,6 +17,8 @@ Run (macOS shown; on Windows use .venv\\Scripts\\python):
     .venv/bin/python motion_detect.py --hold 30        # override LIGHT_HOLD_SECONDS
     .venv/bin/python motion_detect.py --camera rtsp://127.0.0.1:8554/cam --headless
                                                        # network stream, no window
+    .venv/bin/python motion_detect.py --serve 8890     # boxes + motion state as
+                                                       # JSON / server-sent events
 Keys:   q (or Esc) in the video window quits; Ctrl+C quits a --headless run.
 """
 
@@ -52,6 +54,7 @@ LIGHT_SETTLE_SECONDS = 2.0  # ignore motion right after the strip switches, so
 
 import argparse  # noqa: E402  (imports sit below the config block on purpose)
 import asyncio  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
 import signal  # noqa: E402
 import sys  # noqa: E402
@@ -59,6 +62,7 @@ import threading  # noqa: E402
 import time  # noqa: E402
 from contextlib import suppress  # noqa: E402
 from datetime import datetime  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
 from typing import Callable  # noqa: E402
 from urllib.parse import urlsplit, urlunsplit  # noqa: E402
 
@@ -87,6 +91,9 @@ WINDOW_NAME = "Motion (q to quit)"
 MAX_READ_FAILURES = 30
 READ_RETRY_SECONDS = 0.03  # pause between failed reads
 STREAM_RECONNECT_SECONDS = 5.0  # a dropped stream is reopened after this pause
+
+FEED_MAX_RATE = 15.0  # --serve: at most this many events per second per client
+FEED_HEARTBEAT_SECONDS = 1.0  # resend the state this often even if unchanged
 
 BLE_SCAN_TIMEOUT = 10.0
 BLE_RECONNECT_DELAY = 5.0
@@ -281,6 +288,116 @@ def draw_overlay(frame, boxes: list[Box], note: str | None, govee_status: str | 
     )
 
 
+# --------------------------------------------------------------------- feed
+
+
+def parse_serve(value: str) -> tuple[str, int]:
+    """--serve value: "PORT" (all interfaces) or "HOST:PORT"."""
+    host, _, port = value.strip().rpartition(":")
+    if not port.isdigit() or int(port) > 65535:
+        raise argparse.ArgumentTypeError(f"expected PORT or HOST:PORT, got {value!r}")
+    return host or "0.0.0.0", int(port)
+
+
+class MotionFeed:
+    """Latest detection result, shared with the --serve HTTP threads.
+
+    Boxes are published as fractions of the frame (x, y, w, h in 0..1), so a
+    viewer can draw them over the video at whatever size it shows it.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self.version = 0  # bumped on every change; SSE clients wait on it
+        self.closed = False
+        self._cond = threading.Condition()
+        self._state: dict = {"boxes": [], "note": None, "size": None, "light": None}
+        self._last_motion: float | None = None
+
+    def update(self, boxes: list[Box], note: str | None, size: tuple[int, int], light: bool | None) -> None:
+        width, height = size
+        state = {
+            "boxes": [
+                [round(x / width, 4), round(y / height, 4), round(w / width, 4), round(h / height, 4)]
+                for x, y, w, h in boxes
+            ],
+            "note": note,
+            "size": [width, height],
+            "light": light,
+        }
+        with self._cond:
+            if boxes:
+                self._last_motion = self.clock()
+            if state != self._state:
+                self._state = state
+                self.version += 1
+                self._cond.notify_all()
+
+    def snapshot(self) -> dict:
+        with self._cond:
+            since = None if self._last_motion is None else round(self.clock() - self._last_motion, 1)
+            return {"motion": bool(self._state["boxes"]), **self._state, "since": since}
+
+    def wait(self, seen: int, timeout: float) -> None:
+        """Block until the state changes from version `seen` (or timeout / close)."""
+        with self._cond:
+            self._cond.wait_for(lambda: self.version != seen or self.closed, timeout)
+
+    def close(self) -> None:
+        with self._cond:
+            self.closed = True
+            self._cond.notify_all()
+
+
+def start_feed_server(feed: MotionFeed, address: tuple[str, int]) -> ThreadingHTTPServer:
+    """Serve the feed on a background thread.
+
+    GET /motion  one JSON snapshot
+    GET /events  server-sent events: one JSON snapshot per change (rate
+                 limited) plus a heartbeat every FEED_HEARTBEAT_SECONDS
+    CORS is open so a page served from another port (the camera page) can read it.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:  # keep the log for motion, not HTTP
+            pass
+
+        def _start(self, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            if path == "/motion":
+                body = json.dumps(feed.snapshot()).encode()
+                self._start("application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/events":
+                self._start("text/event-stream")
+                self.end_headers()
+                self._stream()
+            else:
+                self.send_error(404)
+
+        def _stream(self) -> None:
+            with suppress(OSError):  # viewer went away (broken pipe / reset)
+                while not feed.closed:
+                    seen = feed.version
+                    self.wfile.write(b"data: " + json.dumps(feed.snapshot()).encode() + b"\n\n")
+                    self.wfile.flush()
+                    time.sleep(1.0 / FEED_MAX_RATE)
+                    feed.wait(seen, FEED_HEARTBEAT_SECONDS)
+
+    server = ThreadingHTTPServer(address, Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="motion-feed", daemon=True).start()
+    return server
+
+
 # --------------------------------------------------------------------- govee
 
 
@@ -330,6 +447,11 @@ class GoveeController:
         self._stopping = asyncio.Event()
         self._main_task: asyncio.Task | None = None
         self._thread = threading.Thread(target=self._run, name="govee-ble", daemon=True)
+
+    @property
+    def light_on(self) -> bool | None:
+        """True / False once the strip has been switched; None before."""
+        return self._light_on
 
     # ---- called from the main thread
     def start(self) -> None:
@@ -472,6 +594,7 @@ def run(
     hold: float = LIGHT_HOLD_SECONDS,
     verbose: bool = False,
     headless: bool = False,
+    feed: MotionFeed | None = None,
 ) -> int:
     cap = open_camera(camera)
     detector = MotionDetector()
@@ -519,6 +642,8 @@ def run(
             if note:
                 boxes = []
 
+            if feed:
+                feed.update(boxes, note, (frame.shape[1], frame.shape[0]), govee.light_on if govee else None)
             if boxes:
                 if govee:
                     govee.motion()
@@ -559,6 +684,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="log every Govee packet and reply")
     parser.add_argument("--headless", action="store_true", help="no video window (for running as a background service)")
+    parser.add_argument(
+        "--serve", type=parse_serve, metavar="[HOST:]PORT",
+        help="publish motion boxes over HTTP: /motion (JSON) and /events (server-sent events)",
+    )
     return parser.parse_args(argv)
 
 
@@ -573,16 +702,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # A service manager stopping us (SIGTERM) should still turn the light off.
     signal.signal(signal.SIGTERM, _interrupt)
+    feed = server = None
+    if args.serve:
+        feed = MotionFeed()
+        try:
+            server = start_feed_server(feed, args.serve)
+        except OSError as exc:
+            print(f"Cannot serve on {args.serve[0]}:{args.serve[1]}: {exc}", file=sys.stderr)
+            return 2
+        host, port = server.server_address[:2]
+        print(f"Motion feed on http://{host}:{port}/events", flush=True)
     try:
         return run(
             args.camera, GOVEE_ENABLED and not args.no_govee, args.seconds,
-            args.hold, args.verbose, args.headless,
+            args.hold, args.verbose, args.headless, feed,
         )
     except CameraError as exc:
         print(exc, file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
+    finally:
+        if server:
+            feed.close()
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

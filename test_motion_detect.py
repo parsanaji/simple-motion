@@ -246,3 +246,117 @@ def test_describe_masks_stream_password():
     masked = m.describe("rtsp://cam:s3cret@10.0.0.5:8554/cam")
     assert "s3cret" not in masked
     assert masked == "stream rtsp://cam:***@10.0.0.5:8554/cam"
+
+
+# ------------------------------------------------------------ motion feed (--serve)
+
+import json  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [("8890", ("0.0.0.0", 8890)), ("127.0.0.1:9000", ("127.0.0.1", 9000)), (" 0 ", ("0.0.0.0", 0))],
+)
+def test_parse_serve(value, expected):
+    assert m.parse_serve(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "abc", "70000", "host:", "-1"])
+def test_parse_serve_rejects_garbage(value):
+    with pytest.raises(m.argparse.ArgumentTypeError):
+        m.parse_serve(value)
+
+
+def test_serve_flag_defaults_off():
+    assert m.parse_args([]).serve is None
+    assert m.parse_args(["--serve", "8890"]).serve == ("0.0.0.0", 8890)
+
+
+def test_feed_normalises_boxes_to_frame_size():
+    now = [50.0]
+    feed = m.MotionFeed(clock=lambda: now[0])
+    feed.update([(640, 360, 320, 180)], note=None, size=(1280, 720), light=None)
+    state = feed.snapshot()
+    assert state["motion"] is True
+    assert state["boxes"] == [[0.5, 0.5, 0.25, 0.25]]
+    assert state["size"] == [1280, 720]
+    assert state["since"] == 0.0
+    now[0] = 62.5
+    feed.update([], note=None, size=(1280, 720), light=True)
+    state = feed.snapshot()
+    assert state["motion"] is False
+    assert state["boxes"] == []
+    assert state["since"] == 12.5  # seconds since the last motion
+    assert state["light"] is True
+
+
+def test_feed_before_any_motion():
+    feed = m.MotionFeed()
+    state = feed.snapshot()
+    assert state["motion"] is False
+    assert state["since"] is None
+    assert state["note"] is None
+
+
+def test_feed_version_bumps_only_on_change():
+    feed = m.MotionFeed()
+    feed.update([], note="warming up", size=(1280, 720), light=None)
+    v1 = feed.version
+    feed.update([], note="warming up", size=(1280, 720), light=None)
+    assert feed.version == v1  # identical state: SSE clients are not woken
+    feed.update([], note=None, size=(1280, 720), light=None)
+    assert feed.version == v1 + 1
+
+
+@pytest.fixture
+def served_feed():
+    feed = m.MotionFeed()
+    server = m.start_feed_server(feed, ("127.0.0.1", 0))
+    host, port = server.server_address[:2]
+    yield feed, f"http://{host}:{port}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_server_motion_json_has_cors(served_feed):
+    feed, base = served_feed
+    feed.update([(0, 0, 128, 72)], note=None, size=(1280, 720), light=None)
+    with urllib.request.urlopen(base + "/motion", timeout=5) as res:
+        assert res.headers["Access-Control-Allow-Origin"] == "*"
+        assert res.headers["Content-Type"].startswith("application/json")
+        state = json.load(res)
+    assert state["motion"] is True
+    assert state["boxes"] == [[0.0, 0.0, 0.1, 0.1]]
+
+
+def test_server_streams_events(served_feed):
+    feed, base = served_feed
+    with urllib.request.urlopen(base + "/events", timeout=5) as res:
+        assert res.headers["Content-Type"].startswith("text/event-stream")
+        assert res.headers["Access-Control-Allow-Origin"] == "*"
+        first = json.loads(res.readline().decode().removeprefix("data: "))
+        assert res.readline() == b"\n"
+        assert first["motion"] is False
+        feed.update([(0, 0, 640, 720)], note=None, size=(1280, 720), light=None)
+        second = json.loads(res.readline().decode().removeprefix("data: "))
+    assert second["motion"] is True
+    assert second["boxes"] == [[0.0, 0.0, 0.5, 1.0]]
+
+
+def test_server_unknown_path_is_404(served_feed):
+    _, base = served_feed
+    with pytest.raises(urllib.error.HTTPError) as err:
+        urllib.request.urlopen(base + "/nope", timeout=5)
+    assert err.value.code == 404
+
+
+def test_run_publishes_motion_to_feed(monkeypatch, capsys, fast_loop):
+    no_gui(monkeypatch)
+    monkeypatch.setattr(m, "open_camera", lambda source: FakeCapture(moving_clip()))
+    feed = m.MotionFeed()
+    assert m.run(0, govee_enabled=False, max_seconds=None, headless=True, feed=feed) == 1
+    state = feed.snapshot()
+    assert state["since"] is not None  # motion was seen and published
+    assert state["size"] == [W, H]

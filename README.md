@@ -42,6 +42,7 @@ MOTION 2026-11-14 13:25:21 (5 areas)
 - **Finds the strip by name** over Bluetooth LE, and reconnects by itself if the link drops.
 - **Works on macOS and Windows.** It picks the right camera backend for each platform.
 - **Runs in the background.** `--headless` drops the window, and on Windows one command installs it as a logon task that restarts itself if it ever exits.
+- **Motion feed for other screens.** `--serve 8890` publishes the boxes and the motion state as JSON and server-sent events, so a web page can draw them over a live stream (on your phone, say).
 - **Webcam or network stream.** Point `--camera` at an RTSP/HTTP URL to share one webcam between this and a live-view app. A dropped stream is reconnected without losing the light connection.
 
 ## How it works
@@ -120,6 +121,7 @@ All settings are in the `CONFIG` block at the top of [`motion_detect.py`](motion
 | `--camera N` | Use camera `N` instead of `CAMERA_INDEX`. |
 | `--camera URL` | Read a network stream instead, e.g. `rtsp://127.0.0.1:8554/cam`. If it drops, it is reopened every 5 s. |
 | `--headless` | No window. Quit with Ctrl+C. For running in the background. |
+| `--serve [HOST:]PORT` | Publish the motion state over HTTP (see [Motion feed](#motion-feed)). `8890` listens on all interfaces, `127.0.0.1:8890` on this machine only. |
 | `--no-govee` | Motion detection only, no Bluetooth. |
 | `--hold S` | Override `LIGHT_HOLD_SECONDS`. |
 | `--seconds S` | Quit by itself after `S` seconds (handy for testing). |
@@ -182,6 +184,40 @@ start waits a few seconds for the camera, and the stream dies whenever the
 detector stops. With `runOnInit` the stream is always ready. Encoding 720p30
 with `ultrafast` costs about half of one CPU core, and the stream adds roughly
 0.5 to 1 s of delay. The stream is read over TCP.
+
+### Motion feed
+
+`--serve 8890` starts a small HTTP server next to the detector:
+
+| URL | Returns |
+|---|---|
+| `/motion` | The latest state as one JSON object. |
+| `/events` | [Server-sent events](https://developer.mozilla.org/docs/Web/API/Server-sent_events): the state again every time it changes (at most 15 per second), and once a second when nothing changes. |
+
+```json
+{"motion": true, "boxes": [[0.41, 0.22, 0.18, 0.55]], "note": null,
+ "size": [1280, 720], "light": true, "since": 0.0}
+```
+
+- `boxes` are `[x, y, w, h]` as fractions of the frame, so you can scale them to whatever size you show the video at.
+- `since` is seconds since the last motion, or `null` if there has been none yet.
+- `note` is `"warming up..."` or `"light settling..."` while motion is ignored.
+- `light` is the strip state (`null` before it is first switched or with `--no-govee`).
+
+CORS is open (`Access-Control-Allow-Origin: *`), so a page served from another
+port can read it:
+
+```js
+new EventSource("http://pc:8890/events").onmessage = (e) => draw(JSON.parse(e.data));
+```
+
+It has no password. Keep the port on a trusted network: on Windows, allow it in
+the firewall only from addresses you trust (a Tailscale range, for example).
+Install the task with it:
+
+```bat
+powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera rtsp://127.0.0.1:8554/cam -ExtraArgs --serve,8890
+```
 
 ## Just the light: `govee_h6147.py`
 
