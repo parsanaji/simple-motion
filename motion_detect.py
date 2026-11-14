@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""Webcam motion detector (OpenCV MOG2) that lights a Govee strip on motion.
+
+Shows the live feed, draws boxes around moving areas, prints
+"MOTION <timestamp>" at most once per COOLDOWN_SECONDS, and turns the Govee
+strip on (solid colour) while motion continues. The strip turns off again after
+LIGHT_HOLD_SECONDS without motion.
+
+Setup (once, in this folder):
+    macOS:    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    Windows:  py -m venv .venv && .venv\\Scripts\\pip install -r requirements.txt
+Run (macOS shown; on Windows use .venv\\Scripts\\python):
+    .venv/bin/python motion_detect.py
+    .venv/bin/python motion_detect.py --list-cameras   # find the Logitech's index
+    .venv/bin/python motion_detect.py --no-govee       # camera only, no Bluetooth
+    .venv/bin/python motion_detect.py --camera 1       # override CAMERA_INDEX
+    .venv/bin/python motion_detect.py --hold 30        # override LIGHT_HOLD_SECONDS
+Keys:   q (or Esc) in the video window quits.
+"""
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+CAMERA_INDEX = 0  # 0 = first camera. On a Mac the built-in camera is usually 0
+#                   and a USB Logitech usually 1; on a Windows PC with no
+#                   built-in camera the Logitech is usually 0.
+#                   Run with --list-cameras to check.
+FRAME_WIDTH = 1280  # requested capture size; the camera may pick the nearest
+FRAME_HEIGHT = 720
+
+MIN_CONTOUR_AREA = 800  # px^2, measured on the frame downscaled to
+#                         PROCESS_WIDTH (640). Smaller moving blobs are ignored.
+COOLDOWN_SECONDS = 3.0  # minimum gap between "MOTION" prints
+WARMUP_SECONDS = 2.0  # ignore motion while MOG2 learns the scene and the
+#                       camera's auto-exposure settles
+MAX_CHANGED_FRACTION = 0.5  # if more than this share of the frame changes at
+#                             once it is a lighting change, not motion
+
+GOVEE_ENABLED = True
+GOVEE_DEVICE_NAME = "H6147"  # matched case-insensitively inside the BLE name
+#                              (e.g. "ihoment_H6147_1A2B"); never by address
+GOVEE_COLOR = (255, 0, 0)  # RGB shown on motion
+GOVEE_COLOR_VARIANT = "rgb-02"  # packet format confirmed working on the H6147
+LIGHT_HOLD_SECONDS = 10.0  # strip turns off after this long without motion
+LIGHT_SETTLE_SECONDS = 2.0  # ignore motion right after the strip switches, so
+#                             its own glow on the room never counts as motion
+# =============================================================================
+
+import argparse  # noqa: E402  (imports sit below the config block on purpose)
+import asyncio  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from contextlib import suppress  # noqa: E402
+from datetime import datetime  # noqa: E402
+from typing import Callable  # noqa: E402
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")  # quiet camera-probe noise
+
+import cv2  # noqa: E402
+from bleak import BleakClient, BleakScanner  # noqa: E402
+from bleak.exc import BleakError  # noqa: E402
+
+from govee_h6147 import (  # noqa: E402
+    NOTIFY_CHAR,
+    VARIANTS_BY_NAME,
+    WRITE_CHAR,
+    keepalive_packet,
+    model_filter,
+    power_packet,
+)
+
+PROCESS_WIDTH = 640  # detection runs on a downscaled copy: faster, and the
+#                      area threshold does not depend on camera resolution
+SETTLE_LEARNING_RATE = 0.2  # MOG2 re-learns the newly lit scene in ~1 s
+WINDOW_NAME = "Motion (q to quit)"
+MAX_READ_FAILURES = 30
+
+BLE_SCAN_TIMEOUT = 10.0
+BLE_RECONNECT_DELAY = 5.0
+BLE_KEEPALIVE_SECONDS = 2.0
+BLE_TICK_SECONDS = 0.5
+
+Box = tuple[int, int, int, int]  # x, y, w, h in full-frame pixels
+
+
+# --------------------------------------------------------------------- camera
+
+
+def camera_backend() -> int:
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform.startswith("win"):
+        # DirectShow opens Logitech cams in ~1 s; the MSMF default can take 30 s+.
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
+MAC_PERMISSION_WAIT = 20.0  # seconds to wait for the user to click "Allow"
+
+
+def _try_open(index: int) -> cv2.VideoCapture:
+    backend = camera_backend()
+    cap = cv2.VideoCapture(index, backend)
+    if not cap.isOpened() and backend != cv2.CAP_ANY:
+        cap.release()
+        cap = cv2.VideoCapture(index)  # let OpenCV pick any backend
+    return cap
+
+
+def open_camera(index: int, width: int = FRAME_WIDTH, height: int = FRAME_HEIGHT) -> cv2.VideoCapture:
+    cap = _try_open(index)
+    if not cap.isOpened() and sys.platform == "darwin":
+        # First run: macOS shows the camera permission prompt asynchronously
+        # and OpenCV fails immediately. Give the user time to click Allow.
+        print(f"Waiting up to {MAC_PERMISSION_WAIT:.0f}s for camera permission...", flush=True)
+        deadline = time.monotonic() + MAC_PERMISSION_WAIT
+        while not cap.isOpened() and time.monotonic() < deadline:
+            cap.release()
+            time.sleep(1.0)
+            cap = _try_open(index)
+    if not cap.isOpened():
+        raise SystemExit(
+            f"Could not open camera {index}. Try --list-cameras. On macOS, allow "
+            "camera access for your terminal app (System Settings > Privacy & "
+            "Security > Camera); on Windows, close other apps using the camera."
+        )
+    if sys.platform.startswith("win"):
+        # MJPG lets USB webcams deliver 720p/1080p at full frame rate.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap
+
+
+def list_cameras(max_index: int = 6) -> None:
+    print("Probing camera indexes (OpenCV cannot read camera names)...")
+    found = False
+    for index in range(max_index):
+        cap = cv2.VideoCapture(index, camera_backend())
+        ok, frame = cap.read() if cap.isOpened() else (False, None)
+        cap.release()
+        if ok and frame is not None:
+            found = True
+            h, w = frame.shape[:2]
+            print(f"  camera {index}: {w}x{h}")
+    if not found:
+        print("  none found (check camera permission / cable)")
+
+
+# --------------------------------------------------------------------- motion
+
+
+class MotionDetector:
+    """MOG2 background subtraction; returns bounding boxes of moving areas."""
+
+    def __init__(
+        self,
+        min_area: float = MIN_CONTOUR_AREA,
+        process_width: int = PROCESS_WIDTH,
+        max_changed_fraction: float = MAX_CHANGED_FRACTION,
+    ) -> None:
+        self.min_area = min_area
+        self.process_width = process_width
+        self.max_changed_fraction = max_changed_fraction
+        self.subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=25, detectShadows=True
+        )
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    def detect(self, frame, learning_rate: float = -1.0) -> list[Box]:
+        """learning_rate -1 = MOG2 automatic; higher re-learns the background faster."""
+        width = frame.shape[1]
+        scale = min(1.0, self.process_width / width)
+        small = (
+            cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            if scale < 1.0
+            else frame
+        )
+        small = cv2.GaussianBlur(small, (5, 5), 0)
+        mask = self.subtractor.apply(small, learningRate=learning_rate)
+        # MOG2 marks shadows as 127 and foreground as 255: keep only real motion.
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        if cv2.countNonZero(mask) > self.max_changed_fraction * mask.size:
+            return []  # whole-scene change: lights switched / exposure jump
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)  # drop speckle
+        mask = cv2.dilate(mask, self.kernel, iterations=2)  # merge nearby blobs
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes: list[Box] = []
+        for contour in contours:
+            if cv2.contourArea(contour) < self.min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            boxes.append((round(x / scale), round(y / scale), round(w / scale), round(h / scale)))
+        return boxes
+
+
+class Cooldown:
+    """ready() is True at most once per `seconds`."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self.seconds = seconds
+        self.clock = clock
+        self._last: float | None = None
+
+    def ready(self) -> bool:
+        now = self.clock()
+        if self._last is None or now - self._last >= self.seconds:
+            self._last = now
+            return True
+        return False
+
+
+def draw_overlay(frame, boxes: list[Box], note: str | None, govee_status: str | None) -> None:
+    for x, y, w, h in boxes:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    if note:
+        cv2.putText(frame, note, (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3, cv2.LINE_AA)
+    elif boxes:
+        cv2.putText(frame, "MOTION", (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
+    footer = "q: quit" + (f"   govee: {govee_status}" if govee_status else "")
+    cv2.putText(
+        frame, footer, (12, frame.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+        (255, 255, 255), 1, cv2.LINE_AA,
+    )
+
+
+# --------------------------------------------------------------------- govee
+
+
+def light_action(light_on: bool | None, last_motion: float | None, now: float, hold: float) -> str | None:
+    """Decide what the strip should do. light_on None = unknown (never touched)."""
+    if last_motion is None:
+        return None
+    want_on = now - last_motion < hold
+    if want_on and light_on is not True:
+        return "on"
+    if not want_on and light_on is True:
+        return "off"
+    return None
+
+
+def light_settling(last_change: float | None, now: float, settle: float = LIGHT_SETTLE_SECONDS) -> bool:
+    """True while the room lighting is still adjusting to a strip on/off."""
+    return last_change is not None and now - last_change < settle
+
+
+class GoveeController:
+    """Keeps a BLE link to the strip on a background thread with its own event loop.
+
+    The OpenCV window must stay on the main thread (macOS requirement), so all
+    Bluetooth work happens here. The main thread only calls motion() and stop().
+    """
+
+    def __init__(
+        self,
+        name: str = GOVEE_DEVICE_NAME,
+        color: tuple[int, int, int] = GOVEE_COLOR,
+        variant: str = GOVEE_COLOR_VARIANT,
+        hold: float = LIGHT_HOLD_SECONDS,
+        verbose: bool = False,
+    ) -> None:
+        self.name = name
+        self.verbose = verbose
+        self.color_packet = VARIANTS_BY_NAME[variant].packet(color)
+        self.hold = hold
+        self.status = "starting"
+        self.last_change: float | None = None  # monotonic time of last on/off
+        self._last_motion: float | None = None  # float writes are atomic under the GIL
+        self._light_on: bool | None = None
+        self._in_session = False
+        self._loop = asyncio.new_event_loop()
+        self._wake = asyncio.Event()
+        self._stopping = asyncio.Event()
+        self._main_task: asyncio.Task | None = None
+        self._thread = threading.Thread(target=self._run, name="govee-ble", daemon=True)
+
+    # ---- called from the main thread
+    def start(self) -> None:
+        self._thread.start()
+
+    def motion(self) -> None:
+        self._last_motion = time.monotonic()
+        if self._light_on is not True:  # only wake the BLE loop when it has work
+            with suppress(RuntimeError):  # loop already closed during shutdown
+                self._loop.call_soon_threadsafe(self._wake.set)
+
+    def stop(self, timeout: float = 6.0) -> None:
+        if not self._thread.is_alive():
+            return
+
+        def signal() -> None:
+            self._stopping.set()
+            self._wake.set()
+            # Not connected (scanning / connecting / waiting): nothing to turn
+            # off, so cancel right away instead of waiting out the scan.
+            if not self._in_session and self._main_task:
+                self._main_task.cancel()
+
+        with suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(signal)
+        self._thread.join(timeout)
+
+    # ---- BLE thread
+    def _set_status(self, status: str) -> None:
+        if status != self.status:
+            self.status = status
+            print(f"[govee] {status}", flush=True)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._main_task = self._loop.create_task(self._main())
+        with suppress(asyncio.CancelledError):
+            self._loop.run_until_complete(self._main_task)
+        self._loop.close()
+
+    async def _main(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                await self._session()
+            except (BleakError, asyncio.TimeoutError, OSError) as exc:
+                self._set_status(f"error: {exc or type(exc).__name__}")
+            if not self._stopping.is_set():
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stopping.wait(), BLE_RECONNECT_DELAY)
+
+    async def _session(self) -> None:
+        self._set_status(f"scanning for {self.name}")
+        device = await BleakScanner.find_device_by_filter(
+            model_filter(self.name), timeout=BLE_SCAN_TIMEOUT
+        )
+        if device is None:
+            self._set_status(f"{self.name} not found, retrying")
+            return
+        self._set_status(f"connecting to {device.name}")
+        async with BleakClient(device, timeout=20.0) as client:
+            self._set_status(f"connected to {device.name}")
+            if self.verbose:  # the strip echoes each accepted command back
+                with suppress(BleakError):
+                    await client.start_notify(
+                        NOTIFY_CHAR,
+                        lambda _s, data: print(f"[govee] <- {bytes(data).hex(' ')}", flush=True),
+                    )
+            self._in_session = True
+            try:
+                await self._control_loop(client)
+            finally:
+                self._in_session = False
+        if not self._stopping.is_set():
+            self._set_status("disconnected, reconnecting")
+
+    async def _control_loop(self, client: BleakClient) -> None:
+        async def write(packet: bytes) -> None:
+            if self.verbose:
+                print(f"[govee] -> {packet.hex(' ')}", flush=True)
+            await client.write_gatt_char(WRITE_CHAR, packet)
+
+        last_write = time.monotonic()
+        while client.is_connected:
+            self._wake.clear()
+            if self._stopping.is_set():
+                if self._light_on:
+                    await write(power_packet(False))
+                    self._light_on = False
+                    print("[govee] light off (exit)", flush=True)
+                    await asyncio.sleep(0.3)  # let the write flush before disconnect
+                return
+
+            now = time.monotonic()
+            action = light_action(self._light_on, self._last_motion, now, self.hold)
+            if action == "on":
+                self.last_change = now
+                await write(power_packet(True))
+                await write(self.color_packet)
+                self.last_change = time.monotonic()
+                self._light_on = True
+                print("[govee] light on", flush=True)
+                last_write = now
+            elif action == "off":
+                self.last_change = now
+                await write(power_packet(False))
+                self.last_change = time.monotonic()
+                self._light_on = False
+                print(f"[govee] light off ({self.hold:g}s without motion)", flush=True)
+                last_write = now
+            elif now - last_write >= BLE_KEEPALIVE_SECONDS:
+                await write(keepalive_packet())  # Govee drops idle links
+                last_write = now
+
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), BLE_TICK_SECONDS)
+
+
+# --------------------------------------------------------------------- main
+
+
+def run(
+    camera_index: int,
+    govee_enabled: bool,
+    max_seconds: float | None,
+    hold: float = LIGHT_HOLD_SECONDS,
+    verbose: bool = False,
+) -> int:
+    cap = open_camera(camera_index)
+    detector = MotionDetector()
+    cooldown = Cooldown(COOLDOWN_SECONDS)
+    govee = GoveeController(hold=hold, verbose=verbose) if govee_enabled else None
+    if govee:
+        govee.start()
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Camera {camera_index} open at {width}x{height}. Press q in the window to quit.", flush=True)
+
+    started = time.monotonic()
+    failures = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                failures += 1
+                if failures >= MAX_READ_FAILURES:
+                    print("Camera stopped delivering frames.", file=sys.stderr)
+                    return 1
+                cv2.waitKey(30)
+                continue
+            failures = 0
+
+            now = time.monotonic()
+            warming = now - started < WARMUP_SECONDS
+            settling = govee is not None and light_settling(govee.last_change, now)
+            # Always feed MOG2 so it keeps learning; learn fast while the
+            # room adjusts to the strip switching on/off.
+            boxes = detector.detect(frame, SETTLE_LEARNING_RATE if settling else -1.0)
+            note = "warming up..." if warming else "light settling..." if settling else None
+            if note:
+                boxes = []
+
+            if boxes:
+                if govee:
+                    govee.motion()
+                if cooldown.ready():
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    areas = f"{len(boxes)} area" + ("s" if len(boxes) != 1 else "")
+                    print(f"MOTION {stamp} ({areas})", flush=True)
+
+            draw_overlay(frame, boxes, note, govee.status if govee else None)
+            cv2.imshow(WINDOW_NAME, frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q"), 27):  # q or Esc
+                return 0
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                return 0
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)  # macOS only closes the window after one more event pump
+        if govee:
+            govee.stop()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Webcam motion detector with Govee light.")
+    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help=f"camera index (default {CAMERA_INDEX})")
+    parser.add_argument("--list-cameras", action="store_true", help="probe camera indexes and exit")
+    parser.add_argument("--no-govee", action="store_true", help="do not use the Govee strip")
+    parser.add_argument("--seconds", type=float, help="quit automatically after N seconds")
+    parser.add_argument(
+        "--hold", type=float, default=LIGHT_HOLD_SECONDS,
+        help=f"seconds without motion before the strip turns off (default {LIGHT_HOLD_SECONDS:g})",
+    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="log every Govee packet and reply")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.list_cameras:
+        list_cameras()
+        return 0
+    try:
+        return run(args.camera, GOVEE_ENABLED and not args.no_govee, args.seconds, args.hold, args.verbose)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
