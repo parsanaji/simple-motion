@@ -19,6 +19,9 @@ Run (macOS shown; on Windows use .venv\\Scripts\\python):
                                                        # network stream, no window
     .venv/bin/python motion_detect.py --serve 8890     # boxes + motion state as
                                                        # JSON / server-sent events
+    .venv/bin/python motion_detect.py --gestures       # hand signals: fist arms,
+                                                       # open palm disarms (see
+                                                       # gestures.py for setup)
 Keys:   q (or Esc) in the video window quits; Ctrl+C quits a --headless run.
 """
 
@@ -46,7 +49,10 @@ GOVEE_ENABLED = True
 GOVEE_DEVICE_NAME = "H6147"  # matched case-insensitively inside the BLE name
 #                              (e.g. "ihoment_H6147_1A2B"); never by address
 GOVEE_COLOR = (255, 0, 0)  # RGB shown on motion
-GOVEE_COLOR_VARIANT = "rgb-02"  # packet format confirmed working on the H6147
+GOVEE_COLOR_VARIANT = "rgbic-1501"  # the H6147 is a segment (RGBIC) strip: it ignores
+#                                     the plain rgb-* packets and keeps its old colour
+GOVEE_BRIGHTNESS_MAX = 100  # the strip's value for 100 % brightness (H6147: 100;
+#                             some other Govee models use 255)
 LIGHT_HOLD_SECONDS = 10.0  # strip turns off after this long without motion
 LIGHT_SETTLE_SECONDS = 2.0  # ignore motion right after the strip switches, so
 #                             its own glow on the room never counts as motion
@@ -75,14 +81,16 @@ import cv2  # noqa: E402
 from bleak import BleakClient, BleakScanner  # noqa: E402
 from bleak.exc import BleakError  # noqa: E402
 
+from claps import ClapError, ClapListener  # noqa: E402
+from gestures import Event, GestureEngine, GestureError, create_engine, draw_gestures, pretty  # noqa: E402
 from govee_h6147 import (  # noqa: E402
     NOTIFY_CHAR,
     VARIANTS_BY_NAME,
     WRITE_CHAR,
     keepalive_packet,
     model_filter,
-    power_packet,
 )
+from light_shows import SHOW_RATE, LightDirector, light_action  # noqa: E402, F401
 
 PROCESS_WIDTH = 640  # detection runs on a downscaled copy: faster, and the
 #                      area threshold does not depend on camera resolution
@@ -311,11 +319,33 @@ class MotionFeed:
         self.version = 0  # bumped on every change; SSE clients wait on it
         self.closed = False
         self._cond = threading.Condition()
-        self._state: dict = {"boxes": [], "note": None, "size": None, "light": None}
+        self._state: dict = {
+            "boxes": [], "note": None, "size": None, "light": None, "mode": None, "banner": None, "hands": [],
+        }
         self._last_motion: float | None = None
+        self._snooze_until: float | None = None
 
-    def update(self, boxes: list[Box], note: str | None, size: tuple[int, int], light: bool | None) -> None:
+    def update(
+        self,
+        boxes: list[Box],
+        note: str | None,
+        size: tuple[int, int],
+        light: bool | None,
+        gestures: GestureEngine | None = None,
+    ) -> None:
+        """Publish one frame's result. With hand signals on, pass the engine too:
+        the feed then carries mode ("armed" / "disarmed" / "snoozed"), the seconds
+        of snooze left, the last action's banner and the hands in view."""
         width, height = size
+        mode = banner = None
+        hands: list[list] = []
+        snooze_left = 0.0
+        if gestures:
+            snooze_left = gestures.snooze_left()
+            mode = "snoozed" if snooze_left > 0 else "armed" if gestures.armed else "disarmed"
+            banner = gestures.banner()
+            hands = [[*(round(v, 3) for v in hand.box), pretty(hand.gesture) if hand.gesture else None]
+                     for hand in gestures.hands]
         state = {
             "boxes": [
                 [round(x / width, 4), round(y / height, 4), round(w / width, 4), round(h / height, 4)]
@@ -324,10 +354,14 @@ class MotionFeed:
             "note": note,
             "size": [width, height],
             "light": light,
+            "mode": mode,
+            "banner": banner,
+            "hands": hands,
         }
         with self._cond:
             if boxes:
                 self._last_motion = self.clock()
+            self._snooze_until = self.clock() + snooze_left if snooze_left > 0 else None
             if state != self._state:
                 self._state = state
                 self.version += 1
@@ -336,7 +370,8 @@ class MotionFeed:
     def snapshot(self) -> dict:
         with self._cond:
             since = None if self._last_motion is None else round(self.clock() - self._last_motion, 1)
-            return {"motion": bool(self._state["boxes"]), **self._state, "since": since}
+            snooze = None if self._snooze_until is None else max(0, round(self._snooze_until - self.clock()))
+            return {"motion": bool(self._state["boxes"]), **self._state, "since": since, "snooze": snooze}
 
     def wait(self, seen: int, timeout: float) -> None:
         """Block until the state changes from version `seen` (or timeout / close)."""
@@ -401,18 +436,6 @@ def start_feed_server(feed: MotionFeed, address: tuple[str, int]) -> ThreadingHT
 # --------------------------------------------------------------------- govee
 
 
-def light_action(light_on: bool | None, last_motion: float | None, now: float, hold: float) -> str | None:
-    """Decide what the strip should do. light_on None = unknown (never touched)."""
-    if last_motion is None:
-        return None
-    want_on = now - last_motion < hold
-    if want_on and light_on is not True:
-        return "on"
-    if not want_on and light_on is True:
-        return "off"
-    return None
-
-
 def light_settling(last_change: float | None, now: float, settle: float = LIGHT_SETTLE_SECONDS) -> bool:
     """True while the room lighting is still adjusting to a strip on/off."""
     return last_change is not None and now - last_change < settle
@@ -422,7 +445,8 @@ class GoveeController:
     """Keeps a BLE link to the strip on a background thread with its own event loop.
 
     The OpenCV window must stay on the main thread (macOS requirement), so all
-    Bluetooth work happens here. The main thread only calls motion() and stop().
+    Bluetooth work happens here. The main thread only calls motion(), play(),
+    set_brightness(), off() and stop(). What to send is decided by LightDirector.
     """
 
     def __init__(
@@ -435,12 +459,9 @@ class GoveeController:
     ) -> None:
         self.name = name
         self.verbose = verbose
-        self.color_packet = VARIANTS_BY_NAME[variant].packet(color)
-        self.hold = hold
+        self.director = LightDirector(VARIANTS_BY_NAME[variant].packet, color, hold, GOVEE_BRIGHTNESS_MAX)
         self.status = "starting"
-        self.last_change: float | None = None  # monotonic time of last on/off
-        self._last_motion: float | None = None  # float writes are atomic under the GIL
-        self._light_on: bool | None = None
+        self._logged: str | None = None
         self._in_session = False
         self._loop = asyncio.new_event_loop()
         self._wake = asyncio.Event()
@@ -451,17 +472,49 @@ class GoveeController:
     @property
     def light_on(self) -> bool | None:
         """True / False once the strip has been switched; None before."""
-        return self._light_on
+        return self.director.light_on
+
+    @property
+    def last_change(self) -> float | None:
+        """Monotonic time the room lighting last changed (switch, show step, brightness)."""
+        return self.director.last_change
 
     # ---- called from the main thread
     def start(self) -> None:
         self._thread.start()
 
+    def _nudge(self) -> None:
+        with suppress(RuntimeError):  # loop already closed during shutdown
+            self._loop.call_soon_threadsafe(self._wake.set)
+
     def motion(self) -> None:
-        self._last_motion = time.monotonic()
-        if self._light_on is not True:  # only wake the BLE loop when it has work
-            with suppress(RuntimeError):  # loop already closed during shutdown
-                self._loop.call_soon_threadsafe(self._wake.set)
+        self.director.motion(time.monotonic())
+        if self.director.light_on is not True:  # only wake the BLE loop when it has work
+            self._nudge()
+
+    def play(self, show: str) -> bool:
+        """Start a light show by name; False if there is no such show."""
+        known = self.director.play(show)
+        if known:
+            self._nudge()
+        else:
+            print(f"[govee] no light show called {show!r}", flush=True)
+        return known
+
+    def set_brightness(self, percent: float) -> None:
+        self.director.set_brightness(percent, time.monotonic())
+        self._nudge()
+
+    def toggle(self) -> bool:
+        """Flip the strip by hand; True if it is now meant to be on (and stays on)."""
+        on = self.director.toggle()
+        self._nudge()
+        return on
+
+    def off(self) -> None:
+        """Stop any show and switch the strip off."""
+        self.director.off()
+        self._nudge()
 
     def stop(self, timeout: float = 6.0) -> None:
         if not self._thread.is_alive():
@@ -537,36 +590,56 @@ class GoveeController:
         while client.is_connected:
             self._wake.clear()
             if self._stopping.is_set():
-                if self._light_on:
-                    await write(power_packet(False))
-                    self._light_on = False
+                steps = self.director.shutdown()
+                for _label, packet in steps:
+                    await write(packet)
+                if steps:
                     print("[govee] light off (exit)", flush=True)
                     await asyncio.sleep(0.3)  # let the write flush before disconnect
                 return
 
             now = time.monotonic()
-            action = light_action(self._light_on, self._last_motion, now, self.hold)
-            if action == "on":
-                self.last_change = now
-                await write(power_packet(True))
-                await write(self.color_packet)
-                self.last_change = time.monotonic()
-                self._light_on = True
-                print("[govee] light on", flush=True)
+            steps = self.director.step(now)
+            for _label, packet in steps:
+                await write(packet)
+            if steps:
                 last_write = now
-            elif action == "off":
-                self.last_change = now
-                await write(power_packet(False))
-                self.last_change = time.monotonic()
-                self._light_on = False
-                print(f"[govee] light off ({self.hold:g}s without motion)", flush=True)
-                last_write = now
+                # The lighting kept changing until the last write landed.
+                self.director.last_change = time.monotonic()
+                self._log(steps)
             elif now - last_write >= BLE_KEEPALIVE_SECONDS:
                 await write(keepalive_packet())  # Govee drops idle links
                 last_write = now
 
+            tick = 1 / SHOW_RATE / 2 if self.director.busy else BLE_TICK_SECONDS
             with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), BLE_TICK_SECONDS)
+                await asyncio.wait_for(self._wake.wait(), tick)
+
+    def _log(self, steps: list[tuple[str, bytes]]) -> None:
+        """One line per change of state, not one per packet."""
+        for label, _packet in steps:
+            if label == "colour" or label.startswith("brightness") or label == self._logged:
+                continue
+            self._logged = label
+            print(f"[govee] {'light ' + label if label in ('on', 'off') else label}", flush=True)
+
+
+def apply_gesture(event: Event, light) -> None:
+    """Carry out a gesture action on the strip (a GoveeController, or anything shaped like one)."""
+    if event.action == "brightness":
+        light.set_brightness(event.value)
+    elif event.action == "off":
+        light.off()
+    elif event.action == "arm":
+        light.play("armed")
+    elif event.action == "disarm":
+        light.play("disarmed")
+    elif event.action == "snooze":
+        light.play("snooze")
+    elif event.action == "wake":  # the snooze ran out
+        light.play("armed")
+    elif event.action.startswith("show:"):
+        light.play(event.action.removeprefix("show:"))
 
 
 # --------------------------------------------------------------------- main
@@ -595,6 +668,8 @@ def run(
     verbose: bool = False,
     headless: bool = False,
     feed: MotionFeed | None = None,
+    gestures: GestureEngine | None = None,
+    claps: ClapListener | None = None,
 ) -> int:
     cap = open_camera(camera)
     detector = MotionDetector()
@@ -642,9 +717,25 @@ def run(
             if note:
                 boxes = []
 
+            if gestures:
+                for event in gestures.process(frame):
+                    if not event.repeat:  # a held dial repeats many times a second
+                        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"GESTURE {stamp} {event.gesture} -> {event.action}", flush=True)
+                    if govee:
+                        apply_gesture(event, govee)
+            armed = gestures.watching if gestures else True
+            for _ in range(claps.poll() if claps else 0):
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                what = f"light {'on' if govee.toggle() else 'off'}" if govee else "no light to switch"
+                print(f"CLAP {stamp} double clap -> {what}", flush=True)
+
             if feed:
-                feed.update(boxes, note, (frame.shape[1], frame.shape[0]), govee.light_on if govee else None)
-            if boxes:
+                feed.update(
+                    boxes if armed else [], note, (frame.shape[1], frame.shape[0]),
+                    govee.light_on if govee else None, gestures,
+                )
+            if boxes and armed:
                 if govee:
                     govee.motion()
                 if cooldown.ready():
@@ -653,7 +744,9 @@ def run(
                     print(f"MOTION {stamp} ({areas})", flush=True)
 
             if not headless:
-                draw_overlay(frame, boxes, note, govee.status if govee else None)
+                draw_overlay(frame, boxes if armed else [], note, govee.status if govee else None)
+                if gestures:
+                    draw_gestures(frame, gestures)
                 cv2.imshow(WINDOW_NAME, frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):  # q or Esc
@@ -667,6 +760,10 @@ def run(
             cv2.waitKey(1)  # macOS only closes the window after one more event pump
         if govee:
             govee.stop()
+        if gestures:
+            gestures.close()
+        if claps:
+            claps.close()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -687,6 +784,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve", type=parse_serve, metavar="[HOST:]PORT",
         help="publish motion boxes over HTTP: /motion (JSON) and /events (server-sent events)",
+    )
+    parser.add_argument(
+        "--gestures", action="store_true",
+        help="hand signals: hold a fist to arm, an open palm to disarm (needs requirements-gestures.txt)",
+    )
+    parser.add_argument(
+        "--claps", action="store_true",
+        help="clap twice to switch the light on or off (uses the microphone; needs requirements-claps.txt)",
     )
     return parser.parse_args(argv)
 
@@ -713,11 +818,17 @@ def main(argv: list[str] | None = None) -> int:
         host, port = server.server_address[:2]
         print(f"Motion feed on http://{host}:{port}/events", flush=True)
     try:
+        gestures = create_engine() if args.gestures else None
+        if gestures:
+            print("Gestures on: fist arms, open palm disarms; see gestures.py for the rest.", flush=True)
+        claps = ClapListener() if args.claps else None
+        if claps:
+            print("Claps on: clap twice to switch the light on or off.", flush=True)
         return run(
             args.camera, GOVEE_ENABLED and not args.no_govee, args.seconds,
-            args.hold, args.verbose, args.headless, feed,
+            args.hold, args.verbose, args.headless, feed, gestures, claps,
         )
-    except CameraError as exc:
+    except (CameraError, GestureError, ClapError) as exc:
         print(exc, file=sys.stderr)
         return 2
     except KeyboardInterrupt:

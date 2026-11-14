@@ -44,6 +44,7 @@ HEADER_COMMAND = 0x33
 HEADER_KEEPALIVE = 0xAA
 
 CMD_POWER = 0x01
+CMD_BRIGHTNESS = 0x04
 CMD_COLOR = 0x05
 
 RED = (0xFF, 0x00, 0x00)
@@ -71,6 +72,12 @@ def build_packet(header: int, payload: Sequence[int]) -> bytes:
 
 def power_packet(on: bool) -> bytes:
     return build_packet(HEADER_COMMAND, [CMD_POWER, 0x01 if on else 0x00])
+
+
+def brightness_packet(percent: float, scale: int = 0xFF) -> bytes:
+    """Brightness 1-100 %. `scale` is the strip's value for 100 % (0xFF or 0x64 by model)."""
+    value = max(1, min(scale, round(percent / 100 * scale)))
+    return build_packet(HEADER_COMMAND, [CMD_BRIGHTNESS, value])
 
 
 def keepalive_packet() -> bytes:

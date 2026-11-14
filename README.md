@@ -42,6 +42,8 @@ MOTION 2026-11-14 13:25:21 (5 areas)
 - **Finds the strip by name** over Bluetooth LE, and reconnects by itself if the link drops.
 - **Works on macOS and Windows.** It picks the right camera backend for each platform.
 - **Runs in the background.** `--headless` drops the window, and on Windows one command installs it as a logon task that restarts itself if it ever exits.
+- **Hand signals.** `--gestures` watches for held hand gestures: a fist arms the detector, an open palm disarms it (see [Hand signals](#hand-signals)).
+- **Double clap.** `--claps` listens on the microphone: clap twice to switch the light on or off (see [Double clap](#double-clap)).
 - **Motion feed for other screens.** `--serve 8890` publishes the boxes and the motion state as JSON and server-sent events, so a web page can draw them over a live stream (on your phone, say).
 - **Webcam or network stream.** Point `--camera` at an RTSP/HTTP URL to share one webcam between this and a live-view app. A dropped stream is reconnected without losing the light connection.
 
@@ -109,7 +111,7 @@ All settings are in the `CONFIG` block at the top of [`motion_detect.py`](motion
 | `GOVEE_ENABLED` | `True` | Set to `False` to never use Bluetooth. |
 | `GOVEE_DEVICE_NAME` | `"H6147"` | Text matched inside the strip's Bluetooth name (e.g. `ihoment_H6147_1A2B`). |
 | `GOVEE_COLOR` | `(255, 0, 0)` | RGB colour shown on motion. |
-| `GOVEE_COLOR_VARIANT` | `"rgb-02"` | Colour packet format (see [Other Govee models](#other-govee-models)). |
+| `GOVEE_COLOR_VARIANT` | `"rgbic-1501"` | Colour packet format (see [Other Govee models](#other-govee-models)). |
 | `LIGHT_HOLD_SECONDS` | `10.0` | How long without motion before the strip turns off. |
 | `LIGHT_SETTLE_SECONDS` | `2.0` | Motion is ignored for this long after the strip switches. |
 
@@ -122,6 +124,8 @@ All settings are in the `CONFIG` block at the top of [`motion_detect.py`](motion
 | `--camera URL` | Read a network stream instead, e.g. `rtsp://127.0.0.1:8554/cam`. If it drops, it is reopened every 5 s. |
 | `--headless` | No window. Quit with Ctrl+C. For running in the background. |
 | `--serve [HOST:]PORT` | Publish the motion state over HTTP (see [Motion feed](#motion-feed)). `8890` listens on all interfaces, `127.0.0.1:8890` on this machine only. |
+| `--gestures` | Hand signals: hold a fist to arm, an open palm to disarm (see [Hand signals](#hand-signals)). Needs `requirements-gestures.txt`. |
+| `--claps` | Clap twice to switch the light on or off (see [Double clap](#double-clap)). Needs `requirements-claps.txt`. |
 | `--no-govee` | Motion detection only, no Bluetooth. |
 | `--hold S` | Override `LIGHT_HOLD_SECONDS`. |
 | `--seconds S` | Quit by itself after `S` seconds (handy for testing). |
@@ -196,13 +200,15 @@ with `ultrafast` costs about half of one CPU core, and the stream adds roughly
 
 ```json
 {"motion": true, "boxes": [[0.41, 0.22, 0.18, 0.55]], "note": null,
- "size": [1280, 720], "light": true, "since": 0.0}
+ "size": [1280, 720], "light": true, "since": 0.0,
+ "mode": "armed", "snooze": null, "banner": null, "hands": []}
 ```
 
 - `boxes` are `[x, y, w, h]` as fractions of the frame, so you can scale them to whatever size you show the video at.
 - `since` is seconds since the last motion, or `null` if there has been none yet.
 - `note` is `"warming up..."` or `"light settling..."` while motion is ignored.
 - `light` is the strip state (`null` before it is first switched or with `--no-govee`).
+- With `--gestures`: `mode` is `"armed"`, `"disarmed"` or `"snoozed"`; `snooze` is the seconds of snooze left; `banner` is the last action for a few seconds (`"DISARMED by Open Palm"`); `hands` are `[x, y, w, h, gesture]` for each hand in view. While disarmed or snoozed, `boxes` stays empty. Without `--gestures` these are `null` / `[]`.
 
 CORS is open (`Access-Control-Allow-Origin: *`), so a page served from another
 port can read it:
@@ -218,6 +224,47 @@ Install the task with it:
 ```bat
 powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera rtsp://127.0.0.1:8554/cam -ExtraArgs --serve,8890
 ```
+
+## Hand signals
+
+`--gestures` adds hand-signal control. Recognition is Google's [MediaPipe Gesture Recognizer](https://ai.google.dev/edge/mediapipe/solutions/vision/gesture_recognizer), a small pretrained model that takes a few milliseconds per frame on a laptop CPU. It is an optional extra, so install it once:
+
+```sh
+.venv/bin/pip install -r requirements-gestures.txt        # macOS
+.venv\Scripts\pip install -r requirements-gestures.txt    # Windows
+.venv/bin/python motion_detect.py --gestures
+```
+
+The 8 MB model file is downloaded into `models/` on the first run.
+
+| Hold for 1 second | What happens |
+| --- | --- |
+| Closed fist | **Arm**: motion turns the light on and is logged (the default state). Two red blinks confirm. |
+| Open palm | **Disarm**: motion is ignored until you arm again. Two green blinks confirm. |
+| Victory | Rainbow light show (12 s) |
+| "I love you" (thumb, index and little finger) | Pink heartbeat light show (10 s) |
+| Thumb up | Disco light show (10 s) |
+| Thumb down | Stop the show and switch the light off |
+| Pointing up | **Brightness dial**: keep pointing and move your hand up (brighter) or down (dimmer). Drop your hand to finish. |
+| Wave (side to side, about twice there and back) | **Snooze**: motion is ignored for 5 minutes, then it arms again by itself. The light fades out in blue. A fist ends the snooze early. |
+
+The video window shows a box around each hand with the gesture name, a bar that fills while you hold, an `ARMED` / `DISARMED` / `SNOOZE 4:59` badge and a gauge while you dial the brightness. Each action is logged as `GESTURE <time> <gesture> -> <action>`.
+
+Bindings, hold time, confidence, the wave and the snooze length live in the CONFIG block at the top of `gestures.py`. Light shows live in `light_shows.py`: a show is a name, a length and a function from time to colour, so adding one takes a few lines. While a show plays, motion detection pauses, since the changing light would look like motion.
+
+Your hand has to be big enough in the picture: roughly 5% of the frame width or more, which is about arm's length to two metres from a 720p webcam.
+
+### Double clap
+
+`--claps` listens on the microphone: clap twice and the light switches on or off. A light switched on by clapping stays on until you clap again (or show a thumb down); it does not wait for motion.
+
+```sh
+.venv/bin/pip install -r requirements-claps.txt        # macOS (already there if you installed the gesture extra)
+.venv\Scripts\pip install -r requirements-claps.txt    # Windows
+.venv/bin/python motion_detect.py --gestures --claps
+```
+
+Only loudness is measured; no sound is recorded or kept. macOS asks for microphone permission for your terminal app the first time. Two claps count when they are 0.12 to 0.6 seconds apart, short, and clearly louder than the room; three or more in a row (applause) are ignored. Each one is logged as `CLAP <time> double clap -> light on`. Tune `CLAP_THRESHOLD` and friends in the CONFIG block of `claps.py`.
 
 ## Just the light: `govee_h6147.py`
 
@@ -238,11 +285,13 @@ The code was tested on an **H6147**, but most Govee Bluetooth lights use the sam
 2. Run `govee_h6147.py --model H618E`. It tries each colour format and asks whether the strip turned red.
 3. Put the model in `GOVEE_DEVICE_NAME` and the format that worked in `GOVEE_COLOR_VARIANT`.
 
+> Set the strip to a colour other than red in the Govee app first. A strip that is already red looks like a pass for every format, even the ones it ignores.
+
 | Variant | Packet (after `33 05`) | Typical devices |
 |---|---|---|
-| `rgb-02` | `02 R G B` | Classic RGB strips (H6147 ✓) |
+| `rgb-02` | `02 R G B` | Classic RGB strips |
 | `rgb-0d` | `0D R G B` | Newer RGB firmware |
-| `rgbic-1501` | `15 01 R G B 00×5 FF 7F` | RGBIC segment strips, all segments |
+| `rgbic-1501` | `15 01 R G B 00×5 FF 7F` | RGBIC segment strips, all segments (H6147 ✓) |
 | `rgbic-0b` | `0B R G B 00×5 FF 7F` | Older RGBIC firmware |
 
 <details>
