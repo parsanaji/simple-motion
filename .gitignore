@@ -1,2 +1,4 @@
 .venv/
 __pycache__/
+motion.log
+motion.log.1

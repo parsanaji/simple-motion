@@ -41,6 +41,8 @@ MOTION 2026-11-14 13:25:21 (5 areas)
 - **Ignores noise.** Tiny changes (minimum contour area), shadows, whole-room lighting changes, and the strip's own glow are not counted as motion.
 - **Finds the strip by name** over Bluetooth LE, and reconnects by itself if the link drops.
 - **Works on macOS and Windows.** It picks the right camera backend for each platform.
+- **Runs in the background.** `--headless` drops the window, and on Windows one command installs it as a logon task that restarts itself if it ever exits.
+- **Webcam or network stream.** Point `--camera` at an RTSP/HTTP URL to share one webcam between this and a live-view app. A dropped stream is reconnected without losing the light connection.
 
 ## How it works
 
@@ -97,7 +99,7 @@ All settings are in the `CONFIG` block at the top of [`motion_detect.py`](motion
 
 | Setting | Default | What it does |
 |---|---|---|
-| `CAMERA_INDEX` | `0` | Which camera to use. Use `--list-cameras` to find it. |
+| `CAMERA_INDEX` | `0` | Which camera to use. Use `--list-cameras` to find it. For a stream URL, use `--camera`. |
 | `FRAME_WIDTH` / `FRAME_HEIGHT` | `1280` / `720` | Requested capture size. |
 | `MIN_CONTOUR_AREA` | `800` | Smallest moving area (in px², measured at 640 px width) that counts as motion. Raise it if small things trigger it. |
 | `COOLDOWN_SECONDS` | `3.0` | Minimum time between `MOTION` prints. |
@@ -116,10 +118,70 @@ All settings are in the `CONFIG` block at the top of [`motion_detect.py`](motion
 |---|---|
 | `--list-cameras` | Show the available camera indexes and exit. |
 | `--camera N` | Use camera `N` instead of `CAMERA_INDEX`. |
+| `--camera URL` | Read a network stream instead, e.g. `rtsp://127.0.0.1:8554/cam`. If it drops, it is reopened every 5 s. |
+| `--headless` | No window. Quit with Ctrl+C. For running in the background. |
 | `--no-govee` | Motion detection only, no Bluetooth. |
 | `--hold S` | Override `LIGHT_HOLD_SECONDS`. |
 | `--seconds S` | Quit by itself after `S` seconds (handy for testing). |
 | `-v`, `--verbose` | Log every packet sent to the strip and every reply from it. |
+
+## Run it in the background
+
+### Windows: start at logon, restart on exit
+
+```bat
+powershell -ExecutionPolicy Bypass -File windows\install-task.ps1
+```
+
+This creates a scheduled task called `SimpleMotion` and starts it right away.
+It runs `motion_detect.py --headless` at every logon with no window, and
+starts it again 10 s after it exits for any reason. Output goes to
+`motion.log` in the repo folder (rotated at 5 MB).
+
+| Do this | Command (from the repo folder) |
+|---|---|
+| Use another camera or a stream | `... install-task.ps1 -Camera 1` or `-Camera rtsp://127.0.0.1:8554/cam` |
+| Pass more flags | `... install-task.ps1 -ExtraArgs --hold,30` |
+| Watch the log | `Get-Content motion.log -Wait -Tail 20` |
+| Stop it until next logon | `... install-task.ps1 -Stop` |
+| Start it again now | `Start-ScheduledTask SimpleMotion` |
+| Remove it | `... install-task.ps1 -Uninstall` |
+
+The task runs as you, in your desktop session, only while you are logged in.
+That is on purpose: Windows does not give webcams or Bluetooth to background
+services. If the detector is stopped while the strip is on, the strip stays on
+until the next run turns it off.
+
+### macOS
+
+```sh
+nohup .venv/bin/python -u motion_detect.py --headless >> motion.log 2>&1 &
+```
+
+### Sharing the webcam with other apps
+
+On Windows only one app can use a webcam at a time. To also watch the camera
+live (VLC, a browser, your phone), let an RTSP server such as
+[mediamtx](https://github.com/bluenviron/mediamtx) own the camera and point
+simple-motion at the stream:
+
+```yaml
+# mediamtx.yml: capture the webcam all the time, not only while someone watches
+paths:
+  cam:
+    runOnInit: ffmpeg -f dshow -video_size 1280x720 -framerate 30 -vcodec mjpeg -i video="HD Pro Webcam C920" -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnInitRestart: yes
+```
+
+```bat
+powershell -ExecutionPolicy Bypass -File windows\install-task.ps1 -Camera rtsp://127.0.0.1:8554/cam
+```
+
+`runOnDemand` works too (the detector counts as a viewer), but then every
+start waits a few seconds for the camera, and the stream dies whenever the
+detector stops. With `runOnInit` the stream is always ready. Encoding 720p30
+with `ultrafast` costs about half of one CPU core, and the stream adds roughly
+0.5 to 1 s of delay. The stream is read over TCP.
 
 ## Just the light: `govee_h6147.py`
 
@@ -176,6 +238,8 @@ The strip echoes each accepted command on the notify characteristic `…2b10`
 | Wrong camera opens | iPhones (Continuity Camera) and virtual cameras shift the indexes. Run `--list-cameras` and set `CAMERA_INDEX`. |
 | `python: command not found` / `externally-managed-environment` on a Mac | Homebrew Python has only `python3` and blocks global `pip`. Use the venv from Quick start. |
 | Camera slow to open on Windows | Already handled: the script uses DirectShow with MJPG instead of the slow default backend. |
+| `Could not open camera` on Windows while another app shows the camera | Windows lets one app use a webcam at a time. Close the other app, or share the camera as a stream (see [Sharing the webcam](#sharing-the-webcam-with-other-apps)). |
+| Background task runs but there is no camera or Bluetooth | It must run in your logged-in desktop session. Install it with `install-task.ps1` from your own account, not as a service or over SSH. |
 
 ## Development
 

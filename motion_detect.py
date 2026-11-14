@@ -15,7 +15,9 @@ Run (macOS shown; on Windows use .venv\\Scripts\\python):
     .venv/bin/python motion_detect.py --no-govee       # camera only, no Bluetooth
     .venv/bin/python motion_detect.py --camera 1       # override CAMERA_INDEX
     .venv/bin/python motion_detect.py --hold 30        # override LIGHT_HOLD_SECONDS
-Keys:   q (or Esc) in the video window quits.
+    .venv/bin/python motion_detect.py --camera rtsp://127.0.0.1:8554/cam --headless
+                                                       # network stream, no window
+Keys:   q (or Esc) in the video window quits; Ctrl+C quits a --headless run.
 """
 
 # =============================================================================
@@ -24,7 +26,9 @@ Keys:   q (or Esc) in the video window quits.
 CAMERA_INDEX = 0  # 0 = first camera. On a Mac the built-in camera is usually 0
 #                   and a USB Logitech usually 1; on a Windows PC with no
 #                   built-in camera the Logitech is usually 0.
-#                   Run with --list-cameras to check.
+#                   Run with --list-cameras to check. --camera also takes a
+#                   stream URL (rtsp://, http://), e.g. a camera that is
+#                   already shared by an RTSP server.
 FRAME_WIDTH = 1280  # requested capture size; the camera may pick the nearest
 FRAME_HEIGHT = 720
 
@@ -49,14 +53,19 @@ LIGHT_SETTLE_SECONDS = 2.0  # ignore motion right after the strip switches, so
 import argparse  # noqa: E402  (imports sit below the config block on purpose)
 import asyncio  # noqa: E402
 import os  # noqa: E402
+import signal  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 from contextlib import suppress  # noqa: E402
 from datetime import datetime  # noqa: E402
 from typing import Callable  # noqa: E402
+from urllib.parse import urlsplit, urlunsplit  # noqa: E402
 
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")  # quiet camera-probe noise
+# RTSP over TCP: no lost UDP packets (grey smears that look like motion), and
+# many RTSP servers only allow TCP anyway.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 import cv2  # noqa: E402
 from bleak import BleakClient, BleakScanner  # noqa: E402
@@ -76,6 +85,8 @@ PROCESS_WIDTH = 640  # detection runs on a downscaled copy: faster, and the
 SETTLE_LEARNING_RATE = 0.2  # MOG2 re-learns the newly lit scene in ~1 s
 WINDOW_NAME = "Motion (q to quit)"
 MAX_READ_FAILURES = 30
+READ_RETRY_SECONDS = 0.03  # pause between failed reads
+STREAM_RECONNECT_SECONDS = 5.0  # a dropped stream is reopened after this pause
 
 BLE_SCAN_TIMEOUT = 10.0
 BLE_RECONNECT_DELAY = 5.0
@@ -83,9 +94,38 @@ BLE_KEEPALIVE_SECONDS = 2.0
 BLE_TICK_SECONDS = 0.5
 
 Box = tuple[int, int, int, int]  # x, y, w, h in full-frame pixels
+Source = int | str  # camera index or stream URL
+
+
+class CameraError(Exception):
+    """The camera or stream could not be opened."""
 
 
 # --------------------------------------------------------------------- camera
+
+
+def parse_camera(value: str) -> Source:
+    """--camera value: a camera index ("0") or a stream URL ("rtsp://...")."""
+    if value.strip().isdigit():
+        return int(value)
+    if "://" in value:
+        return value
+    raise argparse.ArgumentTypeError(f"expected a camera index or a stream URL, got {value!r}")
+
+
+def is_stream(source: Source) -> bool:
+    return isinstance(source, str)
+
+
+def describe(source: Source) -> str:
+    """Printable name for a source, with any password in the URL masked."""
+    if not is_stream(source):
+        return f"camera {source}"
+    parts = urlsplit(source)
+    if parts.password:
+        host = parts.netloc.rsplit("@", 1)[1]
+        source = urlunsplit(parts._replace(netloc=f"{parts.username}:***@{host}"))
+    return f"stream {source}"
 
 
 def camera_backend() -> int:
@@ -109,7 +149,22 @@ def _try_open(index: int) -> cv2.VideoCapture:
     return cap
 
 
-def open_camera(index: int, width: int = FRAME_WIDTH, height: int = FRAME_HEIGHT) -> cv2.VideoCapture:
+def open_stream(url: str) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap.release()
+        raise CameraError(
+            f"Could not open {describe(url)}. Check that the stream server is "
+            "running and that the URL plays in VLC or ffplay."
+        )
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low where supported
+    return cap
+
+
+def open_camera(source: Source, width: int = FRAME_WIDTH, height: int = FRAME_HEIGHT) -> cv2.VideoCapture:
+    if is_stream(source):
+        return open_stream(source)
+    index = source
     cap = _try_open(index)
     if not cap.isOpened() and sys.platform == "darwin":
         # First run: macOS shows the camera permission prompt asynchronously
@@ -121,7 +176,7 @@ def open_camera(index: int, width: int = FRAME_WIDTH, height: int = FRAME_HEIGHT
             time.sleep(1.0)
             cap = _try_open(index)
     if not cap.isOpened():
-        raise SystemExit(
+        raise CameraError(
             f"Could not open camera {index}. Try --list-cameras. On macOS, allow "
             "camera access for your terminal app (System Settings > Privacy & "
             "Security > Camera); on Windows, close other apps using the camera."
@@ -395,24 +450,42 @@ class GoveeController:
 # --------------------------------------------------------------------- main
 
 
+def reconnect(source: Source, cap: cv2.VideoCapture) -> cv2.VideoCapture:
+    """Reopen a dropped stream, retrying until it comes back."""
+    cap.release()
+    while True:
+        print(f"{describe(source)} lost, reconnecting in {STREAM_RECONNECT_SECONDS:g}s", flush=True)
+        time.sleep(STREAM_RECONNECT_SECONDS)
+        try:
+            cap = open_camera(source)
+        except CameraError as exc:
+            print(exc, file=sys.stderr, flush=True)
+            continue
+        print(f"{describe(source)} reconnected", flush=True)
+        return cap
+
+
 def run(
-    camera_index: int,
+    camera: Source,
     govee_enabled: bool,
     max_seconds: float | None,
     hold: float = LIGHT_HOLD_SECONDS,
     verbose: bool = False,
+    headless: bool = False,
 ) -> int:
-    cap = open_camera(camera_index)
+    cap = open_camera(camera)
     detector = MotionDetector()
     cooldown = Cooldown(COOLDOWN_SECONDS)
     govee = GoveeController(hold=hold, verbose=verbose) if govee_enabled else None
     if govee:
         govee.start()
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    if not headless:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Camera {camera_index} open at {width}x{height}. Press q in the window to quit.", flush=True)
+    how = "Headless, Ctrl+C to quit." if headless else "Press q in the window to quit."
+    print(f"{describe(camera).capitalize()} open at {width}x{height}. {how}", flush=True)
 
     started = time.monotonic()
     failures = 0
@@ -422,9 +495,17 @@ def run(
             if not ok or frame is None:
                 failures += 1
                 if failures >= MAX_READ_FAILURES:
-                    print("Camera stopped delivering frames.", file=sys.stderr)
-                    return 1
-                cv2.waitKey(30)
+                    if not is_stream(camera):
+                        print("Camera stopped delivering frames.", file=sys.stderr)
+                        return 1
+                    # Keep the detector and the Bluetooth link; only the
+                    # network stream needs to come back.
+                    cap = reconnect(camera, cap)
+                    failures = 0
+                elif headless:
+                    time.sleep(READ_RETRY_SECONDS)
+                else:
+                    cv2.waitKey(max(1, int(READ_RETRY_SECONDS * 1000)))
                 continue
             failures = 0
 
@@ -446,25 +527,29 @@ def run(
                     areas = f"{len(boxes)} area" + ("s" if len(boxes) != 1 else "")
                     print(f"MOTION {stamp} ({areas})", flush=True)
 
-            draw_overlay(frame, boxes, note, govee.status if govee else None)
-            cv2.imshow(WINDOW_NAME, frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):  # q or Esc
-                return 0
+            if not headless:
+                draw_overlay(frame, boxes, note, govee.status if govee else None)
+                cv2.imshow(WINDOW_NAME, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q"), 27):  # q or Esc
+                    return 0
             if max_seconds is not None and time.monotonic() - started >= max_seconds:
                 return 0
     finally:
         cap.release()
-        cv2.destroyAllWindows()
-        cv2.waitKey(1)  # macOS only closes the window after one more event pump
+        if not headless:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)  # macOS only closes the window after one more event pump
         if govee:
             govee.stop()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Webcam motion detector with Govee light.")
-    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help=f"camera index (default {CAMERA_INDEX})")
+    parser.add_argument(
+        "--camera", type=parse_camera, default=CAMERA_INDEX,
+        help=f"camera index or stream URL such as rtsp://host:8554/cam (default {CAMERA_INDEX})",
+    )
     parser.add_argument("--list-cameras", action="store_true", help="probe camera indexes and exit")
     parser.add_argument("--no-govee", action="store_true", help="do not use the Govee strip")
     parser.add_argument("--seconds", type=float, help="quit automatically after N seconds")
@@ -473,7 +558,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"seconds without motion before the strip turns off (default {LIGHT_HOLD_SECONDS:g})",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="log every Govee packet and reply")
+    parser.add_argument("--headless", action="store_true", help="no video window (for running as a background service)")
     return parser.parse_args(argv)
+
+
+def _interrupt(_signum, _frame) -> None:
+    raise KeyboardInterrupt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -481,8 +571,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_cameras:
         list_cameras()
         return 0
+    # A service manager stopping us (SIGTERM) should still turn the light off.
+    signal.signal(signal.SIGTERM, _interrupt)
     try:
-        return run(args.camera, GOVEE_ENABLED and not args.no_govee, args.seconds, args.hold, args.verbose)
+        return run(
+            args.camera, GOVEE_ENABLED and not args.no_govee, args.seconds,
+            args.hold, args.verbose, args.headless,
+        )
+    except CameraError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         return 130
 

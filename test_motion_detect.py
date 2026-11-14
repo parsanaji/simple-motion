@@ -122,3 +122,127 @@ def test_fast_learning_absorbs_new_lighting():
 )
 def test_light_settling_window(last_change, now, expected):
     assert m.light_settling(last_change, now, settle=2.0) is expected
+
+
+# ------------------------------------------------------------ camera sources
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("0", 0),
+        ("2", 2),
+        ("rtsp://127.0.0.1:8554/cam", "rtsp://127.0.0.1:8554/cam"),
+        ("http://cam.local/video.mjpg", "http://cam.local/video.mjpg"),
+    ],
+)
+def test_camera_source_accepts_index_or_url(value, expected):
+    assert m.parse_camera(value) == expected
+    assert m.parse_args(["--camera", value]).camera == expected
+
+
+def test_camera_source_rejects_garbage():
+    with pytest.raises(SystemExit):
+        m.parse_args(["--camera", "webcam"])
+
+
+def test_is_stream():
+    assert m.is_stream("rtsp://127.0.0.1:8554/cam")
+    assert not m.is_stream(0)
+
+
+def test_headless_flag():
+    assert m.parse_args([]).headless is False
+    assert m.parse_args(["--headless"]).headless is True
+
+
+# ------------------------------------------------------------ run loop
+
+
+class FakeCapture:
+    """Delivers the given frames, then fails every read (like an unplugged cam)."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        if self.frames:
+            return True, self.frames.pop(0)
+        return False, None
+
+    def get(self, prop):
+        return {m.cv2.CAP_PROP_FRAME_WIDTH: W, m.cv2.CAP_PROP_FRAME_HEIGHT: H}.get(prop, 0)
+
+    def release(self):
+        self.released = True
+
+
+def moving_clip():
+    frames = [background(i) for i in range(60)]
+    for i in range(5):
+        frame = background(2000 + i)
+        frame[200:400, 500 + 20 * i : 700 + 20 * i] = 255
+        frames.append(frame)
+    return frames
+
+
+def no_gui(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("headless run touched the GUI")
+
+    for name in ("namedWindow", "imshow", "waitKey", "destroyAllWindows"):
+        monkeypatch.setattr(m.cv2, name, boom)
+
+
+@pytest.fixture
+def fast_loop(monkeypatch):
+    monkeypatch.setattr(m, "WARMUP_SECONDS", 0.0)
+    monkeypatch.setattr(m, "READ_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(m, "STREAM_RECONNECT_SECONDS", 0.0)
+
+
+def test_headless_run_detects_motion_without_any_window(monkeypatch, capsys, fast_loop):
+    no_gui(monkeypatch)
+    cap = FakeCapture(moving_clip())
+    monkeypatch.setattr(m, "open_camera", lambda source: cap)
+    code = m.run(0, govee_enabled=False, max_seconds=None, headless=True)
+    out = capsys.readouterr().out
+    assert code == 1  # local camera stopped delivering frames: exit
+    assert "MOTION" in out
+    assert cap.released
+
+
+def test_stream_reconnects_instead_of_exiting(monkeypatch, capsys, fast_loop):
+    no_gui(monkeypatch)
+
+    class Done(Exception):
+        pass
+
+    opened = []
+
+    def fake_open(source):
+        opened.append(source)
+        if len(opened) == 3:
+            raise Done
+        return FakeCapture(moving_clip() if len(opened) == 1 else [background(7)] * 3)
+
+    monkeypatch.setattr(m, "open_camera", fake_open)
+    url = "rtsp://127.0.0.1:8554/cam"
+    with pytest.raises(Done):
+        m.run(url, govee_enabled=False, max_seconds=None, headless=True)
+    assert opened == [url, url, url]
+    out = capsys.readouterr().out
+    assert "MOTION" in out
+    assert "reconnecting" in out
+
+
+def test_describe_masks_stream_password():
+    assert m.describe(0) == "camera 0"
+    assert m.describe("rtsp://127.0.0.1:8554/cam") == "stream rtsp://127.0.0.1:8554/cam"
+    masked = m.describe("rtsp://cam:s3cret@10.0.0.5:8554/cam")
+    assert "s3cret" not in masked
+    assert masked == "stream rtsp://cam:***@10.0.0.5:8554/cam"
